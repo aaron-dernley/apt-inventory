@@ -169,7 +169,7 @@ export function parseAptSimulation(
 
 /** Model definition for observing APT package inventory and pending upgrades. */
 export const model = {
-  type: "@aaronge/apt",
+  type: "@aaronge/apt-inventory",
   version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
   resources: {

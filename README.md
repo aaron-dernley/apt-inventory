@@ -1,6 +1,6 @@
 # apt-inventory
 
-A [swamp](https://github.com/swamp-club/swamp) model (`@aaronge/apt`) that
+A [swamp](https://github.com/swamp-club/swamp) model (`@aaronge/apt-inventory`) that
 observes APT package state and produces versioned, queryable data about what
 is installed and what is pending. Observation and reporting only — it does
 not replace `unattended-upgrades`, and does not do package pinning, repo
@@ -48,6 +48,6 @@ server, and widening its sudo surface is not this model's call to make alone.
 
 ## Model type
 
-- Type: `@aaronge/apt`, instance: `apt-local`
+- Type: `@aaronge/apt-inventory`, instance: `apt-local`
 - Source: `extensions/models/apt.ts`
 - Tests: `extensions/models/apt_test.ts` (`~/.swamp/deno/deno test extensions/models/apt_test.ts`)
