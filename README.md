@@ -35,7 +35,7 @@ re-verify against real output before trusting the data.
 | 1 | `query` / `listUpgradable` (read-only, no privileges) | Done |
 | 2 | `apt-report` workflow over versioned data | Done |
 | 3 | `refresh` (needs root) | Done |
-| 4 | `install` / `remove` (needs root, gated) | Optional, not started |
+| 4 | `install` / `remove` (needs root, gated) | Done |
 
 Scheduling `apt-report` to actually run daily (via `swamp serve`) is deliberately
 on hold until this has been exercised for a while — see "Scheduling" below.
@@ -52,8 +52,40 @@ aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get update -qq
 ```
 
 This grants NOPASSWD for exactly that one invocation — nothing else gains
-root. `install`/`remove` (Phase 4, optional, not built) would need their own
-explicit approval and their own narrowly-scoped sudoers lines if pursued.
+root.
+
+`install`/`remove` (Phase 4) also need root, and — since the build order's
+"only after Phase 1-3 have run reliably for a while" guidance hadn't really
+been satisfied yet when this was built — were deliberately scoped to a fixed
+allowlist of packages (the 3 real pending security updates at the time) rather
+than a general wildcard, per explicit user approval:
+
+```
+# /etc/sudoers.d/swamp-apt-install (mode 0440, root:root)
+Defaults!/usr/bin/apt-get env_keep += "DEBIAN_FRONTEND"
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq libssl3t64
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl-provider-legacy
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl=3.5.7-1~deb13u2
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq libssl3t64=3.5.7-1~deb13u2
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl-provider-legacy=3.5.7-1~deb13u2
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq openssl
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq libssl3t64
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq openssl-provider-legacy
+```
+
+The `Defaults!/usr/bin/apt-get env_keep` line lets `DEBIAN_FRONTEND` pass
+through sudo's `env_reset` for this one binary specifically — without it, the
+`noninteractive` frontend setting would be silently dropped. This is a
+mechanical requirement of the already-approved command working correctly, not
+an additional privilege grant on its own.
+
+**This allowlist only covers these 3 packages.** `install`/`remove` on any
+other package will fail with a sudo permission error until the sudoers file
+is extended — that's intentional, not a bug. The model code itself is fully
+generic (`install(package, version?)` / `remove(package)`); the restriction to
+these specific packages lives entirely in sudoers, not in the TypeScript, so
+widening it later is a sudoers edit, not a code change.
 
 ## Model type
 
@@ -102,6 +134,31 @@ long-term: it doesn't change across codenames/releases as long as the machine
 tracks the `stable` suite, whereas a codename-based substring would need
 updating on every release upgrade and would never actually match in the
 meantime.
+
+## install / remove
+
+Both are idempotent: `install(package, version?)` checks current state via
+the same `dpkg-query` path `query` uses, and no-ops (no `apt-get` call at all)
+if the package is already present — at the requested version if one was
+given, any version otherwise. `remove(package)` no-ops if the package is
+already absent. Both always re-snapshot and write a fresh `installed`
+resource afterward, whether or not anything actually changed.
+
+Live-verified on this machine:
+
+- No-op paths confirmed fast (~100ms, vs. several seconds for a real
+  `apt-get` call) for both `install` (package already present, no version
+  requested) and `remove` (package already absent).
+- Real mutation path: `install` with `package: openssl, version:
+  3.5.7-1~deb13u2` genuinely ran `sudo apt-get install -y -qq
+  openssl=3.5.7-1~deb13u2`, which apt resolved into upgrading all three
+  pending packages (`openssl`, `libssl3t64`, `openssl-provider-legacy`) in one
+  transaction. Confirmed via direct `dpkg-query` afterward, and via
+  `listUpgradable` dropping to `count: 0, securityCount: 0` — the tool
+  correctly observed its own mutation.
+- `remove`'s real mutation path (an actual uninstall) was not exercised live —
+  there was no package worth safely removing on this machine to test with.
+  The code is structurally symmetric with `install`'s verified mutation path.
 
 ## Scheduling
 

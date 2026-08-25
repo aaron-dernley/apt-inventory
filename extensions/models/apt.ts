@@ -36,6 +36,19 @@ const GlobalArgsSchema = z.object({
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
+const InstallArgsSchema = z.object({
+  package: z.string().describe("Package name to install."),
+  version: z.string().optional().describe(
+    "Exact version to install (e.g. `1:2.3.4-1`). If omitted, installs " +
+      "apt's candidate version. No-ops if the requested version — or, if " +
+      "omitted, any version — is already installed.",
+  ),
+});
+
+const RemoveArgsSchema = z.object({
+  package: z.string().describe("Package name to remove."),
+});
+
 const InstalledPackageSchema = z.object({
   name: z.string().describe("Package name (dpkg ${Package})."),
   version: z.string().describe(
@@ -173,10 +186,53 @@ export function parseAptSimulation(
   return results;
 }
 
+type WriteResource = (
+  specName: string,
+  name: string,
+  data: Record<string, unknown>,
+) => Promise<{ name: string }>;
+
+/** Snapshots installed packages via dpkg-query and writes the `installed` resource. */
+async function captureInstalled(timeoutMs: number, writeResource: WriteResource) {
+  const { stdout, code } = await runCommand(
+    "dpkg-query",
+    ["-W", "-f=${Package}\t${Version}\t${Architecture}\t${Status}\n"],
+    timeoutMs,
+  );
+
+  if (code !== 0) {
+    throw new Error(`dpkg-query exited with code ${code}`);
+  }
+
+  const packages = parseDpkgQuery(stdout);
+
+  return await writeResource("installed", "installed", {
+    packages,
+    count: packages.length,
+    capturedAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Looks up a single package's installed version, or null if absent.
+ * dpkg-query exits non-zero when a package is entirely unknown to dpkg —
+ * that's an expected "not installed" outcome here, not a failure, so only
+ * the parsed stdout is trusted, not the exit code.
+ */
+async function getInstalledVersion(pkg: string, timeoutMs: number): Promise<string | null> {
+  const { stdout } = await runCommand(
+    "dpkg-query",
+    ["-W", "-f=${Package}\t${Version}\t${Architecture}\t${Status}\n", pkg],
+    timeoutMs,
+  );
+  const packages = parseDpkgQuery(stdout);
+  return packages.length > 0 ? packages[0].version : null;
+}
+
 /** Model definition for observing APT package inventory and pending upgrades. */
 export const model = {
   type: "@aaronge/apt-inventory",
-  version: "2026.08.25.2",
+  version: "2026.08.25.3",
   globalArguments: GlobalArgsSchema,
   reports: ["@aaronge/apt-inventory-delta"],
   resources: {
@@ -199,33 +255,9 @@ export const model = {
       arguments: z.object({}),
       execute: async (
         _args: Record<string, never>,
-        context: {
-          globalArgs: GlobalArgs;
-          writeResource: (
-            specName: string,
-            name: string,
-            data: Record<string, unknown>,
-          ) => Promise<{ name: string }>;
-        },
+        context: { globalArgs: GlobalArgs; writeResource: WriteResource },
       ) => {
-        const { stdout, code } = await runCommand(
-          "dpkg-query",
-          ["-W", "-f=${Package}\t${Version}\t${Architecture}\t${Status}\n"],
-          context.globalArgs.timeout,
-        );
-
-        if (code !== 0) {
-          throw new Error(`dpkg-query exited with code ${code}`);
-        }
-
-        const packages = parseDpkgQuery(stdout);
-
-        const handle = await context.writeResource("installed", "installed", {
-          packages,
-          count: packages.length,
-          capturedAt: new Date().toISOString(),
-        });
-
+        const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
         return { dataHandles: [handle] };
       },
     },
@@ -234,14 +266,7 @@ export const model = {
       arguments: z.object({}),
       execute: async (
         _args: Record<string, never>,
-        context: {
-          globalArgs: GlobalArgs;
-          writeResource: (
-            specName: string,
-            name: string,
-            data: Record<string, unknown>,
-          ) => Promise<{ name: string }>;
-        },
+        context: { globalArgs: GlobalArgs; writeResource: WriteResource },
       ) => {
         const { stdout, code } = await runCommand(
           "apt-get",
@@ -287,6 +312,58 @@ export const model = {
         }
 
         return { dataHandles: [] };
+      },
+    },
+    install: {
+      description: "Installs a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq` (root required, gated by sudoers to specific packages). Idempotent: no-ops if already satisfied. Produces a fresh `installed` snapshot either way.",
+      arguments: InstallArgsSchema,
+      execute: async (
+        args: z.infer<typeof InstallArgsSchema>,
+        context: { globalArgs: GlobalArgs; writeResource: WriteResource },
+      ) => {
+        const current = await getInstalledVersion(args.package, context.globalArgs.timeout);
+        const satisfied = args.version ? current === args.version : current !== null;
+
+        if (!satisfied) {
+          const target = args.version ? `${args.package}=${args.version}` : args.package;
+          const { code, stderr } = await runCommand(
+            "sudo",
+            ["DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", target],
+            context.globalArgs.timeout,
+          );
+
+          if (code !== 0) {
+            throw new Error(`apt-get install ${target} exited with code ${code}: ${stderr}`);
+          }
+        }
+
+        const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
+        return { dataHandles: [handle] };
+      },
+    },
+    remove: {
+      description: "Removes a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq` (root required, gated by sudoers to specific packages). Idempotent: no-ops if already absent. Produces a fresh `installed` snapshot either way.",
+      arguments: RemoveArgsSchema,
+      execute: async (
+        args: z.infer<typeof RemoveArgsSchema>,
+        context: { globalArgs: GlobalArgs; writeResource: WriteResource },
+      ) => {
+        const current = await getInstalledVersion(args.package, context.globalArgs.timeout);
+
+        if (current !== null) {
+          const { code, stderr } = await runCommand(
+            "sudo",
+            ["DEBIAN_FRONTEND=noninteractive", "apt-get", "remove", "-y", "-qq", args.package],
+            context.globalArgs.timeout,
+          );
+
+          if (code !== 0) {
+            throw new Error(`apt-get remove ${args.package} exited with code ${code}: ${stderr}`);
+          }
+        }
+
+        const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
+        return { dataHandles: [handle] };
       },
     },
   },
