@@ -215,10 +215,47 @@ an install gate.
 
 ## Scheduling
 
-Not wired up yet — deliberately held off until Phase 1/2 have been running
-reliably for a while. `swamp serve` is the mechanism (it evaluates every
-workflow's `trigger.schedule` cron field and fires it — scheduling does *not*
-work via external cron; `swamp serve` must be running continuously, e.g. as a
-systemd service, for a daily run to actually happen). Notably, if `swamp serve`
-runs as a systemd service, its unit must set `HOME` explicitly, or scheduled
-runs fail with `"Unknown model type"`.
+`apt-report` runs daily at 06:00 (`trigger: schedule: "0 6 * * *"` in
+`workflows/workflow-apt-report.yaml`), via `swamp serve` running as a
+systemd service:
+
+```
+# /etc/systemd/system/swamp-serve.service
+[Unit]
+Description=swamp serve (apt-inventory)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aaronge
+Group=aaronge
+Environment=HOME=/home/aaronge
+WorkingDirectory=/home/aaronge/Repositories/apt-inventory
+ExecStart=/usr/local/bin/swamp serve --repo-dir /home/aaronge/Repositories/apt-inventory
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl enable --now swamp-serve.service`. Runs as `aaronge` (not root) —
+this matters because `refresh`/`install`/`remove`'s `sudo` calls are keyed to
+the `aaronge` sudoers entries; running the service as root would sidestep
+those entries entirely. `HOME=/home/aaronge` is set explicitly per the
+gotcha `swamp help serve` calls out directly (scheduled runs fail with
+`"Unknown model type"` without it, since swamp resolves extensions relative
+to `$HOME/.swamp`). Binds to `127.0.0.1:9090` only (the default) — no need
+for network exposure or auth just to run a local schedule.
+
+Verified after starting the service: `swamp workflow trigger get apt-report`
+shows the effective schedule as `"0 6 * * *"`; the service's own startup log
+confirms `Registered schedule for workflow "apt-report": "0 6 * * *"` and
+`Scheduled execution service started with 1 schedules`; `systemctl
+is-enabled` confirms it'll survive a reboot.
+
+**Not verified**: whether the cron expression is interpreted in the system's
+local timezone (`Europe/London`) or UTC — the manual doesn't document this
+either way. Worth confirming once the first real 06:00 run lands; if it
+fires at the wrong wall-clock hour, adjust the cron hour field accordingly.
