@@ -43,6 +43,13 @@ on hold until this has been exercised for a while — see "Scheduling" below.
 
 ## Privileges
 
+**Note on scope**: the sudoers rules below assume the account running
+`swamp-serve` has *only* the grants shown here. If that account has any
+broader pre-existing sudo access (check with `sudo -l`), this scoping isn't
+a hard boundary — any process running as that account already has whatever
+that broader access allows, independent of anything below. Worth verifying
+on whatever machine you deploy this to.
+
 `query` and `listUpgradable` need no privileges. `refresh` needs root, granted
 via a narrow sudoers entry (approved by the user before being applied, per the
 spec — this isn't a call the agent makes alone):
@@ -52,37 +59,57 @@ spec — this isn't a call the agent makes alone):
 aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get update -qq
 ```
 
-This grants NOPASSWD for exactly that one invocation — nothing else gains
-root.
-
-`install`/`remove` (Phase 4) also need root. **Initially** (per the build
-order's "only after Phase 1-3 have run reliably for a while" guidance not
-really being satisfied yet) these were scoped to a fixed 3-package sudoers
-allowlist. **As of Phase 5, sudoers is a wildcard** — the actual restriction
-moved into the model code instead (see "install / remove" below):
+`install` runs through a root-owned wrapper script rather than calling
+`apt-get` directly, so its own safety check can't be bypassed by anything
+that isn't going through that exact script:
 
 ```
 # /etc/sudoers.d/swamp-apt-install (mode 0440, root:root)
 Defaults!/usr/bin/apt-get env_keep += "DEBIAN_FRONTEND"
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq *
+aaronge ALL=(root) NOPASSWD: /usr/local/sbin/apt-security-install
 aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq *
 ```
 
-The `Defaults!/usr/bin/apt-get env_keep` line lets `DEBIAN_FRONTEND` pass
-through sudo's `env_reset` for this one binary specifically — without it, the
-`noninteractive` frontend setting would be silently dropped. This is a
-mechanical requirement of the command working correctly, not an additional
-privilege grant on its own.
+```bash
+# /usr/local/sbin/apt-security-install (mode 0755, root:root — NOT writable
+# by aaronge or any non-root account; verified directly)
+#!/bin/bash
+set -euo pipefail
+readonly SECURITY_ORIGIN="stable-security"
+readonly APT_GET=/usr/bin/apt-get
+PACKAGE="${1:-}"; VERSION="${2:-}"
+[ -n "$PACKAGE" ] && [ -n "$VERSION" ] || { echo "Usage: apt-security-install <package> <version>" >&2; exit 2; }
 
-This was a deliberate, explicit tradeoff (user-approved): sudoers alone can
-only do static text matching — it has no way to express "only packages with
-verified security fixes," so a real allowlist-by-package-name approach could
-never generalize beyond whatever's pending *today*. Moving enforcement into
-the model code (which can read `apt-local`'s own data) means the actual
-security boundary is dynamic and verifiable, not a static list that goes
-stale. `remove` has no equivalent "verified safe" concept, so it's a
-straight wildcard with no code-level gate — same trust level as running
-`apt-get remove` by hand.
+MATCH=""
+while IFS= read -r line; do
+  case "$line" in "Inst "*) ;; *) continue ;; esac
+  read -r _inst pkg rest <<<"$line"
+  [ "$pkg" = "$PACKAGE" ] && { MATCH="$rest"; break; }
+done < <("$APT_GET" -s -qq dist-upgrade)
+
+[ -n "$MATCH" ] || { echo "Refusing: ${PACKAGE} is not currently a pending apt upgrade." >&2; exit 1; }
+case "$MATCH" in *"($VERSION "*) ;; *) echo "Refusing: version mismatch." >&2; exit 1 ;; esac
+case "$MATCH" in *"$SECURITY_ORIGIN"*) ;; *) echo "Refusing: not a security-origin upgrade." >&2; exit 1 ;; esac
+
+exec env DEBIAN_FRONTEND=noninteractive "$APT_GET" install -y -qq "${PACKAGE}=${VERSION}"
+```
+
+Why a wrapper rather than a wildcard + code-level check (the original Phase 5
+design): sudoers can only do static text matching — it can't express "only
+packages with verified security fixes," and a check living purely in swamp's
+own TypeScript only ever runs when something goes *through* swamp. Anything
+else invoking `sudo apt-get install` directly would skip that check entirely.
+Moving the verification into the thing sudoers actually grants access to (a
+script, not raw `apt-get`) means the check runs no matter what invokes it,
+and can't be disabled by editing it, since the calling account can't write to
+it. `remove` has no equivalent "verified safe" concept, so it's a straight
+wildcard with no code-level gate — same trust level as running `apt-get
+remove` by hand (a choice made explicitly, not by default).
+
+The `Defaults!/usr/bin/apt-get env_keep` line lets `DEBIAN_FRONTEND` pass
+through sudo's `env_reset` for `remove`'s direct `apt-get` invocation — the
+wrapper doesn't need it, since its own internal `env DEBIAN_FRONTEND=...`
+happens after sudo has already elevated, not through another sudo call.
 
 ## Model type
 

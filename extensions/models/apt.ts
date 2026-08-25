@@ -321,7 +321,7 @@ async function versionAtLeast(a: string, b: string, timeoutMs: number): Promise<
 /** Model definition for observing APT package inventory and pending upgrades. */
 export const model = {
   type: "@aaronge/apt-inventory",
-  version: "2026.08.25.4",
+  version: "2026.08.25.5",
   globalArguments: GlobalArgsSchema,
   reports: ["@aaronge/apt-inventory-delta"],
   resources: {
@@ -410,7 +410,7 @@ export const model = {
       },
     },
     install: {
-      description: "Installs a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq` (root required; sudoers grants this for any package). The real safety boundary is in this method, not sudoers: a mutating install only ever proceeds for a package+version this tool can itself verify, via the latest `upgradable` resource, is a currently pending apt-classified security update — anything else is refused. Idempotent: no-ops if already satisfied. Produces a fresh `installed` snapshot either way.",
+      description: "Installs a package via the root-owned `/usr/local/sbin/apt-security-install` wrapper (sudoers grants this with no argument restriction). This method's own check below is a fast first-pass for a friendly error message — the real, tamper-resistant enforcement is inside the wrapper itself, which independently re-verifies via a fresh live apt-get simulation (not any file this account can write) that the package+version is a genuine pending security update, regardless of what invokes it. Idempotent: no-ops if already satisfied. Produces a fresh `installed` snapshot either way.",
       arguments: InstallArgsSchema,
       execute: async (
         args: z.infer<typeof InstallArgsSchema>,
@@ -454,15 +454,17 @@ export const model = {
           );
         }
 
-        const target = `${args.package}=${pendingEntry.candidateVersion}`;
         const { code, stderr } = await runCommand(
           "sudo",
-          ["DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", target],
+          ["/usr/local/sbin/apt-security-install", args.package, pendingEntry.candidateVersion],
           context.globalArgs.timeout,
         );
 
         if (code !== 0) {
-          throw new Error(`apt-get install ${target} exited with code ${code}: ${stderr}`);
+          throw new Error(
+            `apt-security-install ${args.package} ${pendingEntry.candidateVersion} exited with ` +
+              `code ${code}: ${stderr}`,
+          );
         }
 
         const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
