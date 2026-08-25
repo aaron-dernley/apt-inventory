@@ -1,0 +1,72 @@
+id: 2a48804b-3b12-4d4c-8108-fdf2559920a3
+name: apt-report
+description: Collects apt package/upgrade state, prints a human-readable report with the delta since the last run, and fails the run when security-relevant upgrades are pending.
+tags: {}
+jobs:
+  - name: collect
+    description: Observe current apt state (read-only, no privileges).
+    steps:
+      - name: list-upgradable
+        description: Simulate a dist-upgrade to see what's pending.
+        task:
+          type: model_method
+          modelIdOrName: apt-local
+          methodName: listUpgradable
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: query-installed
+        description: Snapshot currently installed packages.
+        task:
+          type: model_method
+          modelIdOrName: apt-local
+          methodName: query
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+
+  - name: report
+    description: Print total upgradable, security-relevant, installed counts, and deltas vs the previous run.
+    steps:
+      - name: print-report
+        description: Report values come from the @aaronge/apt-inventory-delta model-scope report, computed automatically after collect's method runs.
+        task:
+          type: model_method
+          modelIdOrName: apt-report-printer
+          methodName: execute
+          inputs:
+            run: |
+              echo "=== apt-inventory report ==="
+              echo "Installed packages:  ${{ data.latest('apt-local', 'report-aaronge-apt-inventory-delta-json').attributes.installedCount }} (delta: ${{ data.latest('apt-local', 'report-aaronge-apt-inventory-delta-json').attributes.installedDelta }})"
+              echo "Upgradable packages: ${{ data.latest('apt-local', 'report-aaronge-apt-inventory-delta-json').attributes.upgradableCount }} (delta: ${{ data.latest('apt-local', 'report-aaronge-apt-inventory-delta-json').attributes.upgradableDelta }})"
+              echo "  of which security: ${{ data.latest('apt-local', 'report-aaronge-apt-inventory-delta-json').attributes.securityCount }} (delta: ${{ data.latest('apt-local', 'report-aaronge-apt-inventory-delta-json').attributes.securityDelta }})"
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn:
+      - job: collect
+        condition:
+          type: completed
+    weight: 0
+
+  - name: alert
+    description: Fail the run when security-relevant upgrades are pending — the notification mechanism for v1.
+    steps:
+      - name: security-gate
+        task:
+          type: assert
+          expr: data.latest("apt-local", "upgradable").attributes.securityCount == 0
+          message: "${{ data.latest('apt-local', 'upgradable').attributes.securityCount }} security-relevant package(s) pending — review and let unattended-upgrades apply them, or investigate manually."
+          severity: high
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn:
+      - job: report
+        condition:
+          type: succeeded
+    weight: 0
+
+version: 1

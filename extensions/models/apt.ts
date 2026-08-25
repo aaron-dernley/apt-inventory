@@ -172,6 +172,7 @@ export const model = {
   type: "@aaronge/apt-inventory",
   version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
+  reports: ["@aaronge/apt-inventory-delta"],
   resources: {
     "installed": {
       description: "Snapshot of installed packages, per `dpkg-query`.",

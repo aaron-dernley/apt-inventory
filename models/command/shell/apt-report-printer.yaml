@@ -1,0 +1,8 @@
+type: command/shell
+typeVersion: 2026.02.09.1
+id: 540f803d-fc5a-4784-9858-b639b8b956e5
+name: apt-report-printer
+version: 1
+tags: {}
+globalArguments: {}
+methods: {}

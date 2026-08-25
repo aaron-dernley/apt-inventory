@@ -33,9 +33,12 @@ output before trusting the data.
 | Phase | Description | Status |
 |---|---|---|
 | 1 | `query` / `listUpgradable` (read-only, no privileges) | Done |
-| 2 | `apt-report` workflow over versioned data | In progress |
+| 2 | `apt-report` workflow over versioned data | Done |
 | 3 | `refresh` (needs root) | Not started — requires a sudoers decision, see below |
 | 4 | `install` / `remove` (needs root, gated) | Optional, not started |
+
+Scheduling `apt-report` to actually run daily (via `swamp serve`) is deliberately
+on hold until Phase 2 has been exercised for a while — see "Scheduling" below.
 
 ## Privileges
 
@@ -51,3 +54,42 @@ server, and widening its sudo surface is not this model's call to make alone.
 - Type: `@aaronge/apt-inventory`, instance: `apt-local`
 - Source: `extensions/models/apt.ts`
 - Tests: `extensions/models/apt_test.ts` (`~/.swamp/deno/deno test extensions/models/apt_test.ts`)
+
+## Reporting
+
+`extensions/reports/apt_delta.ts` (`@aaronge/apt-inventory-delta`) is a
+model-scope report attached by default to `@aaronge/apt-inventory`. It fires
+automatically after `query`/`listUpgradable` and computes installed/upgradable/
+security counts plus the delta versus the previous version of each resource —
+persisted as `report-aaronge-apt-inventory-delta{,-json}` data on the model
+instance, retrievable via `swamp report get @aaronge/apt-inventory-delta
+--model apt-local`.
+
+The `workflows/workflow-apt-report.yaml` workflow ties it together:
+
+1. **`collect`** — runs `listUpgradable` and `query` on `apt-local` (they
+   serialize on the model's lock rather than truly running in parallel, since
+   both target the same instance — not a problem at this scale).
+2. **`report`** — a `command/shell` step (model `apt-report-printer`) that
+   prints the counts/deltas via CEL expressions reading the delta report's
+   JSON attributes.
+3. **`alert`** — an `assert` step that fails the run when
+   `data.latest("apt-local", "upgradable").attributes.securityCount > 0`. A
+   failed run is the v1 notification mechanism.
+
+Verified end-to-end against the real machine, including re-runs to confirm
+version history and delta computation. The `securityCount > 0` failure path
+itself hasn't been exercised live (the machine currently has no pending
+security updates) — it's covered by parser unit tests for security
+classification and by the assert step matching the manual's documented
+pattern exactly.
+
+## Scheduling
+
+Not wired up yet — deliberately held off until Phase 1/2 have been running
+reliably for a while. `swamp serve` is the mechanism (it evaluates every
+workflow's `trigger.schedule` cron field and fires it — scheduling does *not*
+work via external cron; `swamp serve` must be running continuously, e.g. as a
+systemd service, for a daily run to actually happen). Notably, if `swamp serve`
+runs as a systemd service, its unit must set `HOME` explicitly, or scheduled
+runs fail with `"Unknown model type"`.
