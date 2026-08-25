@@ -1,0 +1,20 @@
+manifestVersion: 1
+name: "@aaronge/apt-inventory"
+version: "2026.08.25.1"
+description: "Observes APT package inventory and pending upgrades on Debian/apt-based Linux, with security-update classification, versioned delta reporting, debsecan CVE cross-checking, and a safety-gated install/remove for verified security updates. Verified on Raspberry Pi 5 / Debian 13 trixie, arm64."
+repository: "https://github.com/aaron-dernley/apt-inventory"
+models:
+  - apt.ts
+reports:
+  - apt_delta.ts
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - linux-x86_64
+  - linux-aarch64
+labels:
+  - apt
+  - debian
+  - security
+  - raspberry-pi

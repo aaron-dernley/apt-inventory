@@ -42,17 +42,34 @@ async function latestTwoVersions(
   modelId: string,
   dataName: string,
 ): Promise<{ current: Snapshot | null; previous: Snapshot | null }> {
-  const currentMeta = await dataRepository.findByName(modelType, modelId, dataName);
+  const currentMeta = await dataRepository.findByName(
+    modelType,
+    modelId,
+    dataName,
+  );
   if (!currentMeta) return { current: null, previous: null };
 
   const readVersion = async (version: number) => {
-    const raw = await dataRepository.getContent(modelType, modelId, dataName, version);
+    const raw = await dataRepository.getContent(
+      modelType,
+      modelId,
+      dataName,
+      version,
+    );
     if (!raw) return null;
-    return JSON.parse(new TextDecoder().decode(raw)) as Snapshot;
+    try {
+      return JSON.parse(new TextDecoder().decode(raw)) as Snapshot;
+    } catch {
+      // Malformed stored content shouldn't crash the whole report — treat
+      // it the same as "no data for this version".
+      return null;
+    }
   };
 
   const current = await readVersion(currentMeta.version);
-  const previous = currentMeta.version > 1 ? await readVersion(currentMeta.version - 1) : null;
+  const previous = currentMeta.version > 1
+    ? await readVersion(currentMeta.version - 1)
+    : null;
 
   return { current, previous };
 }
@@ -74,8 +91,12 @@ export const report = {
       modelType: string;
       modelId: string;
       dataRepository: DataRepository;
+      logger: { info: (msg: string, props?: Record<string, unknown>) => void };
     },
   ) => {
+    context.logger.info("Computing apt-inventory delta for {modelId}", {
+      modelId: context.modelId,
+    });
     const upgradable = await latestTwoVersions(
       context.dataRepository,
       context.modelType,
@@ -90,26 +111,41 @@ export const report = {
     );
 
     if (!upgradable.current || !installed.current) {
+      context.logger.info("No apt-inventory data yet — skipping delta");
       return { markdown: "No apt-inventory data yet.", json: {} };
     }
 
-    const installedDelta = installed.current.count - (installed.previous?.count ?? installed.current.count);
-    const upgradableDelta = upgradable.current.count - (upgradable.previous?.count ?? upgradable.current.count);
+    const installedDelta = installed.current.count -
+      (installed.previous?.count ?? installed.current.count);
+    const upgradableDelta = upgradable.current.count -
+      (upgradable.previous?.count ?? upgradable.current.count);
     const securityDelta = (upgradable.current.securityCount ?? 0) -
-      (upgradable.previous?.securityCount ?? upgradable.current.securityCount ?? 0);
+      (upgradable.previous?.securityCount ?? upgradable.current.securityCount ??
+        0);
 
     const hasHistory = upgradable.previous !== null;
 
     const markdown = [
       "# apt-inventory report",
       "",
-      `- **Installed packages**: ${installed.current.count} (${formatDelta(installedDelta)} vs previous run)`,
-      `- **Upgradable packages**: ${upgradable.current.count} (${formatDelta(upgradableDelta)} vs previous run)`,
-      `- **Security-relevant upgrades**: ${upgradable.current.securityCount ?? 0} (${
-        formatDelta(securityDelta)
+      `- **Installed packages**: ${installed.current.count} (${
+        formatDelta(installedDelta)
       } vs previous run)`,
-      ...(hasHistory ? [] : ["", "_(first run — no prior snapshot to compare against)_"]),
+      `- **Upgradable packages**: ${upgradable.current.count} (${
+        formatDelta(upgradableDelta)
+      } vs previous run)`,
+      `- **Security-relevant upgrades**: ${
+        upgradable.current.securityCount ?? 0
+      } (${formatDelta(securityDelta)} vs previous run)`,
+      ...(hasHistory
+        ? []
+        : ["", "_(first run — no prior snapshot to compare against)_"]),
     ].join("\n");
+
+    context.logger.info(
+      "Delta computed: installed {installedDelta}, upgradable {upgradableDelta}, security {securityDelta}",
+      { installedDelta, upgradableDelta, securityDelta },
+    );
 
     return {
       markdown,

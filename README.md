@@ -115,7 +115,16 @@ happens after sudo has already elevated, not through another sudo call.
 
 - Type: `@aaronge/apt-inventory`, instance: `apt-local`
 - Source: `extensions/models/apt.ts`
-- Tests: `extensions/models/apt_test.ts` (`~/.swamp/deno/deno test extensions/models/apt_test.ts`)
+- Tests: `~/.swamp/deno/deno test extensions/` — `apt_test.ts` (parsers:
+  dpkg-query, apt-get simulation, debsecan detail), `apt_install_test.ts`
+  (`decideInstallAction`, the pure safety-gate decision function `install`'s
+  `execute` delegates to — extracted specifically so the gate's branching is
+  unit-testable without mocking subprocesses), `../reports/apt_delta_test.ts`
+  (the delta report). 24 tests total.
+- All methods and the report log at `info` level on entry/completion via
+  `context.logger` (added during the adversarial review pass below — this
+  wasn't there through Phase 1-5, verified live and via the swamp CLI's own
+  `--log-level info` output).
 - **System dependency**: `debsecan` (for `scanVulnerabilities`) — not installed
   by default on Debian; `sudo apt-get install debsecan` once, out-of-band
   (this is one-time host setup, not something swamp mediates per-run). Needs
