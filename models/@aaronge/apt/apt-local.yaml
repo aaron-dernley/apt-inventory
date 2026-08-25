@@ -1,0 +1,10 @@
+type: '@aaronge/apt'
+typeVersion: 2026.08.25.1
+id: 6e7fb930-a0f9-4b50-9b9e-b09a888225b1
+name: apt-local
+version: 1
+tags: {}
+globalArguments:
+  securityOrigin: trixie-security
+  timeout: 120000
+methods: {}
