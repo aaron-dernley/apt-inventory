@@ -215,9 +215,9 @@ an install gate.
 
 ## Scheduling
 
-`apt-report` runs daily at 06:00 (`trigger: schedule: "0 6 * * *"` in
-`workflows/workflow-apt-report.yaml`), via `swamp serve` running as a
-systemd service:
+`apt-report` runs 3x daily — 06:00, 12:00, 20:00 (`trigger: schedule: "0
+6,12,20 * * *"` in `workflows/workflow-apt-report.yaml`), via `swamp serve`
+running as a systemd service:
 
 ```
 # /etc/systemd/system/swamp-serve.service
@@ -250,12 +250,116 @@ to `$HOME/.swamp`). Binds to `127.0.0.1:9090` only (the default) — no need
 for network exposure or auth just to run a local schedule.
 
 Verified after starting the service: `swamp workflow trigger get apt-report`
-shows the effective schedule as `"0 6 * * *"`; the service's own startup log
-confirms `Registered schedule for workflow "apt-report": "0 6 * * *"` and
-`Scheduled execution service started with 1 schedules`; `systemctl
-is-enabled` confirms it'll survive a reboot.
+shows the effective schedule as `"0 6,12,20 * * *"`; the service's own
+startup log confirms `Registered schedule for workflow "apt-report": "0
+6,12,20 * * *"` and `Scheduled execution service started with 1 schedules`;
+`systemctl is-enabled` confirms it'll survive a reboot.
+
+**Changing the schedule requires a `swamp-serve` restart** — schedules are
+registered at server startup, not live-reloaded from the workflow file.
+After editing `trigger.schedule`, run `sudo systemctl restart
+swamp-serve.service` and re-check `swamp workflow trigger get apt-report`.
 
 **Not verified**: whether the cron expression is interpreted in the system's
 local timezone (`Europe/London`) or UTC — the manual doesn't document this
 either way. Worth confirming once the first real 06:00 run lands; if it
 fires at the wrong wall-clock hour, adjust the cron hour field accordingly.
+
+## Day-to-day operation
+
+A small toolkit in `~/.local/bin/` (outside this repo — personal machine
+tooling, not part of the swamp extension) makes this genuinely low-effort to
+live with day to day:
+
+| Command | Does |
+|---|---|
+| `apt-status` | One-shot status: is `swamp-serve` up, recent run history (with failure reasons), the latest report, and whether anything security-relevant is pending right now. Works from any directory. |
+| `apt-monitor` | Opens a `foot` terminal window that auto-refreshes `apt-status` every 30s — a live dashboard you can just glance at. Independent of any shell session; close the window whenever. |
+| `apt-off` | Stops `swamp-serve` **and** disables it (won't restart on reboot either). The single "turn it off" command. |
+| `apt-on` | Re-enables and restarts `swamp-serve`. The single "turn it back on" command. |
+
+`~/.bashrc` also exports `SWAMP_SERVE_URL=ws://127.0.0.1:9090`, so any plain
+`swamp` command (`swamp data query ...`, `swamp report get ...`, etc.) works
+from any directory too — no more `cd`-ing into the repo or remembering
+`--repo-dir`.
+
+**Storage footprint** (checked directly, given the Pi's limited space): the
+`.swamp/data` directory is a few MB and bounded by each resource's
+`garbageCollection` cap — it will not grow unboundedly. The systemd journal
+(covering `swamp-serve`'s own logs, among everything else on the machine) is
+in the single-digit MB range and self-vacuums old entries by default. Neither
+is a real concern against 16GB free.
+
+**Reproducing the toolkit** (e.g. after a fresh SD card):
+
+```bash
+# ~/.local/bin/apt-status — one-shot status check
+#!/bin/bash
+set -euo pipefail
+export SWAMP_SERVE_URL="${SWAMP_SERVE_URL:-ws://127.0.0.1:9090}"
+
+echo "=== swamp-serve service ==="
+systemctl is-active swamp-serve 2>&1 || true
+
+echo
+echo "=== recent apt-report runs ==="
+swamp workflow history search --json \
+  | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for r in d.get('results', [])[:5]:
+    status = r.get('status')
+    started = r.get('startedAt', '?')
+    trigger = r.get('triggerSource', '?')
+    line = f\"{started}  {status:10}  ({trigger})\"
+    if status == 'failed':
+        line += f\"  -> {r.get('failedStep')}: {r.get('failureReason')}\"
+    print(line)
+"
+
+echo
+echo "=== latest report ==="
+swamp report get @aaronge/apt-inventory-delta --model apt-local --markdown
+
+echo
+echo "=== pending security updates right now ==="
+swamp data query 'attributes.securityCount > 0' --json \
+  | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if d.get('total', 0) == 0:
+    print('none')
+else:
+    print(f\"{d['total']} record(s) — run: swamp data get apt-local upgradable --json\")
+"
+```
+
+```bash
+# ~/.local/bin/apt-monitor — friendly live dashboard window
+#!/bin/bash
+set -euo pipefail
+setsid foot -T "apt-inventory monitor" watch -n 30 -c apt-status >/dev/null 2>&1 &
+disown
+echo "Opened. Close the window whenever you don't need it — it's independent of this shell."
+```
+
+```bash
+# ~/.local/bin/apt-off — stop and disable the schedule
+#!/bin/bash
+set -euo pipefail
+sudo systemctl disable --now swamp-serve.service
+echo "swamp-serve stopped and disabled. Scheduled apt-report runs will not happen until you run 'apt-on'."
+```
+
+```bash
+# ~/.local/bin/apt-on — re-enable and start the schedule
+#!/bin/bash
+set -euo pipefail
+sudo systemctl enable --now swamp-serve.service
+sleep 1
+swamp workflow trigger get apt-report --json
+echo "swamp-serve running and enabled. Scheduled apt-report runs: 06:00, 12:00, 20:00 daily."
+```
+
+All four need `chmod +x`, and `~/.local/bin` needs to be on `$PATH` (already
+the case on this machine).

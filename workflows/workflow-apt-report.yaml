@@ -3,7 +3,7 @@ name: apt-report
 description: Collects apt package/upgrade state, prints a human-readable report with the delta since the last run, and fails the run when security-relevant upgrades are pending.
 tags: {}
 trigger:
-  schedule: "0 6 * * *"
+  schedule: "0 6,12,20 * * *"
 jobs:
   - name: refresh
     description: Refresh apt's package lists (root, apt lists only — no other system changes) so collect reflects current repo state.
