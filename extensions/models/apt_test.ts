@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { parseAptSimulation, parseDpkgQuery } from "./apt.ts";
+import { parseAptSimulation, parseDebsecanDetail, parseDpkgQuery } from "./apt.ts";
 
 const NOTE_BANNER = `NOTE: This is only a simulation!
       apt-get needs root privileges for real execution.
@@ -93,4 +93,81 @@ Deno.test("parseDpkgQuery - keeps only install ok installed, splits on tabs not 
 
 Deno.test("parseDpkgQuery - empty input yields empty array", () => {
   assertEquals(parseDpkgQuery(""), []);
+});
+
+// The debsecan fixtures below are real output captured on this machine
+// (Debian 13 trixie, arm64) via `debsecan --suite trixie --format detail`.
+
+Deno.test("parseDebsecanDetail - no fix available (no trailing suite-fix line)", () => {
+  const stdout = `CVE-2026-54369
+  acl before version 2.4.0 contains a symlink traversal vulnerability in ...
+  installed: acl 2.3.2-2+b1
+             (built from acl 2.3.2-2)
+  fixed in unstable: acl 2.4.0-1 (source package)`;
+
+  const result = parseDebsecanDetail(stdout);
+  assertEquals(result, [
+    {
+      cve: "CVE-2026-54369",
+      package: "acl",
+      installedVersion: "2.3.2-2+b1",
+      fixedVersions: [],
+      fixAvailableInSuite: false,
+    },
+  ]);
+});
+
+Deno.test("parseDebsecanDetail - fix available, multiple branch versions", () => {
+  const stdout = `CVE-2025-58060 (fixed)
+  OpenPrinting CUPS is an open source printing system for Linux and othe ...
+  installed: cups 2.4.10-3+rpt2+deb13u2
+             (built from cups 2.4.10-3+rpt2+deb13u2)
+  fixed in unstable: cups 2.4.10-4 (source package)
+  fixed on branch:   cups 2.3.3op2-3+deb11u10 (source package)
+  fixed on branch:   cups 2.4.10-3+deb13u1 (source package)
+  fixed on branch:   cups 2.4.10-3+deb13u2 (source package)
+  fixed on branch:   cups 2.4.2-3+deb12u9 (source package)
+  fix is available for the selected suite (trixie)`;
+
+  const result = parseDebsecanDetail(stdout);
+  assertEquals(result, [
+    {
+      cve: "CVE-2025-58060",
+      package: "cups",
+      installedVersion: "2.4.10-3+rpt2+deb13u2",
+      fixedVersions: [
+        "2.3.3op2-3+deb11u10",
+        "2.4.10-3+deb13u1",
+        "2.4.10-3+deb13u2",
+        "2.4.2-3+deb12u9",
+      ],
+      fixAvailableInSuite: true,
+    },
+  ]);
+});
+
+Deno.test("parseDebsecanDetail - multi-package CVE produces one entry per block", () => {
+  const stdout = `CVE-2026-3184
+  A flaw was found in util-linux. Improper hostname canonicalization in  ...
+  installed: bsdextrautils 2.41.5-0+deb13u1
+             (built from util-linux 2.41.5-0+deb13u1)
+  fixed in unstable: util-linux 2.42-1 (source package)
+  fixed on branch:   util-linux 2.42~rc1-1 (source package)
+
+CVE-2026-3184
+  A flaw was found in util-linux. Improper hostname canonicalization in  ...
+  installed: bsdutils 1:2.41.5-0+deb13u1
+             (built from util-linux 2.41.5-0+deb13u1)
+  fixed in unstable: util-linux 2.42-1 (source package)
+  fixed on branch:   util-linux 2.42~rc1-1 (source package)`;
+
+  const result = parseDebsecanDetail(stdout);
+  assertEquals(result.length, 2);
+  assertEquals(result[0].package, "bsdextrautils");
+  assertEquals(result[1].package, "bsdutils");
+  assertEquals(result[1].installedVersion, "1:2.41.5-0+deb13u1");
+});
+
+Deno.test("parseDebsecanDetail - empty input yields empty array", () => {
+  assertEquals(parseDebsecanDetail(""), []);
 });

@@ -36,6 +36,7 @@ re-verify against real output before trusting the data.
 | 2 | `apt-report` workflow over versioned data | Done |
 | 3 | `refresh` (needs root) | Done |
 | 4 | `install` / `remove` (needs root, gated) | Done |
+| 5 | `scanVulnerabilities` (debsecan, CVE cross-check); widened install/remove sudoers | Done |
 
 Scheduling `apt-report` to actually run daily (via `swamp serve`) is deliberately
 on hold until this has been exercised for a while — see "Scheduling" below.
@@ -54,44 +55,48 @@ aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get update -qq
 This grants NOPASSWD for exactly that one invocation — nothing else gains
 root.
 
-`install`/`remove` (Phase 4) also need root, and — since the build order's
-"only after Phase 1-3 have run reliably for a while" guidance hadn't really
-been satisfied yet when this was built — were deliberately scoped to a fixed
-allowlist of packages (the 3 real pending security updates at the time) rather
-than a general wildcard, per explicit user approval:
+`install`/`remove` (Phase 4) also need root. **Initially** (per the build
+order's "only after Phase 1-3 have run reliably for a while" guidance not
+really being satisfied yet) these were scoped to a fixed 3-package sudoers
+allowlist. **As of Phase 5, sudoers is a wildcard** — the actual restriction
+moved into the model code instead (see "install / remove" below):
 
 ```
 # /etc/sudoers.d/swamp-apt-install (mode 0440, root:root)
 Defaults!/usr/bin/apt-get env_keep += "DEBIAN_FRONTEND"
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq libssl3t64
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl-provider-legacy
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl=3.5.7-1~deb13u2
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq libssl3t64=3.5.7-1~deb13u2
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq openssl-provider-legacy=3.5.7-1~deb13u2
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq openssl
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq libssl3t64
-aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq openssl-provider-legacy
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get install -y -qq *
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get remove -y -qq *
 ```
 
 The `Defaults!/usr/bin/apt-get env_keep` line lets `DEBIAN_FRONTEND` pass
 through sudo's `env_reset` for this one binary specifically — without it, the
 `noninteractive` frontend setting would be silently dropped. This is a
-mechanical requirement of the already-approved command working correctly, not
-an additional privilege grant on its own.
+mechanical requirement of the command working correctly, not an additional
+privilege grant on its own.
 
-**This allowlist only covers these 3 packages.** `install`/`remove` on any
-other package will fail with a sudo permission error until the sudoers file
-is extended — that's intentional, not a bug. The model code itself is fully
-generic (`install(package, version?)` / `remove(package)`); the restriction to
-these specific packages lives entirely in sudoers, not in the TypeScript, so
-widening it later is a sudoers edit, not a code change.
+This was a deliberate, explicit tradeoff (user-approved): sudoers alone can
+only do static text matching — it has no way to express "only packages with
+verified security fixes," so a real allowlist-by-package-name approach could
+never generalize beyond whatever's pending *today*. Moving enforcement into
+the model code (which can read `apt-local`'s own data) means the actual
+security boundary is dynamic and verifiable, not a static list that goes
+stale. `remove` has no equivalent "verified safe" concept, so it's a
+straight wildcard with no code-level gate — same trust level as running
+`apt-get remove` by hand.
 
 ## Model type
 
 - Type: `@aaronge/apt-inventory`, instance: `apt-local`
 - Source: `extensions/models/apt.ts`
 - Tests: `extensions/models/apt_test.ts` (`~/.swamp/deno/deno test extensions/models/apt_test.ts`)
+- **System dependency**: `debsecan` (for `scanVulnerabilities`) — not installed
+  by default on Debian; `sudo apt-get install debsecan` once, out-of-band
+  (this is one-time host setup, not something swamp mediates per-run). Needs
+  network access to fetch its vulnerability database.
+- Global args: `securityOrigin` (default `stable-security`), `timeout`
+  (default `120000`ms), `suite` (default `trixie` — passed to debsecan's
+  `--suite`; unlike `securityOrigin`, this **does** need updating on release
+  upgrade)
 
 ## Reporting
 
@@ -137,28 +142,76 @@ meantime.
 
 ## install / remove
 
-Both are idempotent: `install(package, version?)` checks current state via
-the same `dpkg-query` path `query` uses, and no-ops (no `apt-get` call at all)
-if the package is already present — at the requested version if one was
-given, any version otherwise. `remove(package)` no-ops if the package is
-already absent. Both always re-snapshot and write a fresh `installed`
-resource afterward, whether or not anything actually changed.
+Both are idempotent: `remove(package)` no-ops if the package is already
+absent. `install(package, version?)` no-ops if already at the target
+version — target being the requested `version` if given, or (if omitted)
+whatever's already installed, as long as nothing verified is pending. Both
+always re-snapshot and write a fresh `installed` resource afterward, whether
+or not anything actually changed.
+
+**`install`'s real safety boundary lives in the code, not sudoers** (sudoers
+is a wildcard as of Phase 5 — see "Privileges" above). Before any actual
+mutation, `install` reads `apt-local`'s own latest `upgradable` resource and
+refuses unless the requested package+version is present there with
+`isSecurity: true` — i.e. a real, currently pending, apt-classified security
+update. Anything else (a package with no pending update, a non-security
+pending upgrade, an arbitrary version that doesn't match the verified
+candidate) is refused with a clear error, regardless of what sudoers would
+technically allow. This is a deliberate narrowing from Phase 4's original
+"install any package" behavior to "apply verified pending security updates
+only" — the tradeoff that makes a wildcard sudoers grant safe.
 
 Live-verified on this machine:
 
 - No-op paths confirmed fast (~100ms, vs. several seconds for a real
-  `apt-get` call) for both `install` (package already present, no version
-  requested) and `remove` (package already absent).
+  `apt-get` call): `install` for an already-installed, never-pending package
+  (`bash`); `remove` for an already-absent package (`cowsay`); and `install`
+  re-run for a package that *was* a pending security update but has since
+  been fixed and dropped out of `upgradable` (`openssl`, after being patched
+  — confirms the gate doesn't turn "already applied" into an error).
+- **The gate actually refuses what it should**: `install --input
+  package=cowsay` (no pending update) failed with `"Refusing to install
+  cowsay: not a currently pending security update..."` even though sudoers'
+  wildcard would technically permit the underlying `apt-get` call.
 - Real mutation path: `install` with `package: openssl, version:
-  3.5.7-1~deb13u2` genuinely ran `sudo apt-get install -y -qq
-  openssl=3.5.7-1~deb13u2`, which apt resolved into upgrading all three
-  pending packages (`openssl`, `libssl3t64`, `openssl-provider-legacy`) in one
-  transaction. Confirmed via direct `dpkg-query` afterward, and via
-  `listUpgradable` dropping to `count: 0, securityCount: 0` — the tool
-  correctly observed its own mutation.
+  3.5.7-1~deb13u2` (a genuinely verified pending security update at the
+  time) ran `sudo apt-get install -y -qq openssl=3.5.7-1~deb13u2`, which apt
+  resolved into upgrading all three related packages (`openssl`,
+  `libssl3t64`, `openssl-provider-legacy`) in one transaction. Confirmed via
+  direct `dpkg-query` afterward, and via `listUpgradable` dropping to
+  `count: 0, securityCount: 0`.
 - `remove`'s real mutation path (an actual uninstall) was not exercised live —
   there was no package worth safely removing on this machine to test with.
   The code is structurally symmetric with `install`'s verified mutation path.
+
+## Vulnerability scanning (debsecan)
+
+`scanVulnerabilities` (read-only, no privileges — debsecan itself needs no
+root) runs `debsecan --suite <suite> --format detail` against installed
+packages and writes the `vulnerabilities` resource: every CVE debsecan knows
+about for currently installed packages, whether a fix is available for the
+configured `suite`, and — critically — an independent `actuallyFixed` check.
+
+**Why the independent check exists: debsecan produces real false positives
+on this machine.** Raspberry Pi OS rebuilds packages with its own version
+suffixes (e.g. `+rpt2+deb13u2`), which debsecan's vulnerability database
+doesn't understand — it compares against upstream Debian's fixed version
+string and calls it vulnerable even when `dpkg --compare-versions` confirms
+the installed (rebuilt) version is already newer. Verified concretely on
+this machine with two different packages: `cups` (2.4.10-3+rpt2+deb13u2 vs.
+debsecan's claimed fix 2.4.10-3+deb13u2) and `gstreamer1.0-plugins-bad`
+(1.26.2-3+rpt3+deb13u2 vs. 1.26.2-3+deb13u3) — both already patched per
+dpkg, both flagged as vulnerable by debsecan alone. A live full scan on this
+machine found **347 debsecan "fix available" entries, all 347 of which** are
+false positives per `actuallyFixed` (0 `actionableCount`).
+
+Because of this, `install`'s safety gate (above) deliberately does **not**
+use `scanVulnerabilities`/debsecan data directly — it's anchored to apt's
+own `upgradable`/`isSecurity` classification, which is inherently
+version-comparison-aware and doesn't share this false-positive class.
+`scanVulnerabilities` is enrichment/reporting data (including CVEs with no
+fix available yet at all, which apt-based observation can never see), not
+an install gate.
 
 ## Scheduling
 

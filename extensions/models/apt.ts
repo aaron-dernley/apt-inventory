@@ -32,6 +32,11 @@ const GlobalArgsSchema = z.object({
     "Timeout in milliseconds for apt/dpkg subprocess calls. Apt operations " +
       "over a slow link (e.g. a Pi on wifi) can be genuinely slow.",
   ),
+  suite: z.string().default("trixie").describe(
+    "Debian release codename passed to debsecan's --suite flag. Unlike " +
+      "securityOrigin, this DOES need updating on release upgrade — debsecan " +
+      "wants the codename (e.g. `trixie`), not `stable`.",
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -39,9 +44,13 @@ type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 const InstallArgsSchema = z.object({
   package: z.string().describe("Package name to install."),
   version: z.string().optional().describe(
-    "Exact version to install (e.g. `1:2.3.4-1`). If omitted, installs " +
-      "apt's candidate version. No-ops if the requested version — or, if " +
-      "omitted, any version — is already installed.",
+    "Exact version to install (e.g. `1:2.3.4-1`). If the package is already " +
+      "at this version, no-ops. Otherwise, install only ever proceeds if " +
+      "this package+version is a currently pending, apt-verified security " +
+      "update (per the latest `upgradable` resource's isSecurity flag) — " +
+      "if given, it must match that update's candidateVersion exactly. If " +
+      "omitted, the version is inferred from that same pending security " +
+      "update (or, if already installed and nothing is pending, no-ops).",
   ),
 });
 
@@ -90,6 +99,41 @@ const UpgradableSchema = z.object({
   count: z.number().describe("Total number of upgradable/pending packages."),
   securityCount: z.number().describe("Number of those packages classified as security-relevant."),
   capturedAt: z.iso.datetime().describe("ISO8601 timestamp when this snapshot was taken."),
+});
+
+const VulnerabilitySchema = z.object({
+  cve: z.string().describe("CVE identifier, e.g. `CVE-2025-58060`."),
+  package: z.string().describe("Installed binary package name debsecan reports as affected."),
+  installedVersion: z.string().describe("Installed version debsecan compared against."),
+  fixedVersions: z.array(z.string()).describe(
+    "Fix versions debsecan lists across Debian branches/releases for this CVE's source package.",
+  ),
+  fixAvailableInSuite: z.boolean().describe(
+    "True when debsecan's own report says a fix is available for the configured `suite`.",
+  ),
+  actuallyFixed: z.boolean().describe(
+    "True when `dpkg --compare-versions` shows installedVersion is already >= at least one " +
+      "listed fixedVersion. Exists because debsecan's vulnerability database does not " +
+      "understand vendor-rebuild version suffixes (e.g. Raspberry Pi OS's `+rptN`) — verified " +
+      "on this machine, where every currently fix-available debsecan entry is actually already " +
+      "patched per dpkg's own comparison. Only fixAvailableInSuite && !actuallyFixed is a real, " +
+      "currently actionable vulnerability.",
+  ),
+});
+
+const VulnerabilitiesSchema = z.object({
+  vulnerabilities: z.array(VulnerabilitySchema).describe(
+    "Known CVEs debsecan reports against currently installed packages.",
+  ),
+  count: z.number().describe("Total vulnerability/package entries reported."),
+  actionableCount: z.number().describe(
+    "fixAvailableInSuite && !actuallyFixed — real, currently-fixable vulnerabilities.",
+  ),
+  falsePositiveCount: z.number().describe(
+    "fixAvailableInSuite && actuallyFixed — debsecan flagged these, but dpkg's own version " +
+      "comparison shows they're already patched (see actuallyFixed).",
+  ),
+  capturedAt: z.iso.datetime().describe("ISO8601 timestamp when this scan was taken."),
 });
 
 /** Runs a subprocess, capturing stdout/stderr separately, honoring `timeout`. */
@@ -186,6 +230,45 @@ export function parseAptSimulation(
   return results;
 }
 
+/**
+ * Parses `debsecan --suite <suite> --format detail` output. Blocks are
+ * separated by blank lines; each starts with a `CVE-...` header (optionally
+ * suffixed ` (fixed)` — both forms appear regardless of `--only-fixed`, so
+ * this doesn't require that flag), followed by an `installed: <pkg>
+ * <version>` line and zero or more `fixed on branch:   <src> <version>`
+ * lines. A trailing `fix is available for the selected suite (<suite>)`
+ * line — present 1:1 with the ` (fixed)` header suffix, verified against
+ * real output — is the fixAvailableInSuite signal.
+ */
+export function parseDebsecanDetail(
+  stdout: string,
+): Omit<z.infer<typeof VulnerabilitySchema>, "actuallyFixed">[] {
+  const results: Omit<z.infer<typeof VulnerabilitySchema>, "actuallyFixed">[] = [];
+
+  for (const block of stdout.split("\n\n")) {
+    const cveMatch = /^(CVE-\S+)/.exec(block);
+    const installedMatch = /^ {2}installed: (\S+) (\S+)/m.exec(block);
+    if (!cveMatch || !installedMatch) continue;
+
+    const [, cve] = cveMatch;
+    const [, pkg, installedVersion] = installedMatch;
+
+    const fixedVersions = [...block.matchAll(/^ {2}fixed on branch:\s+\S+ (\S+)/gm)]
+      .map((m) => m[1]);
+    const fixAvailableInSuite = /^ {2}fix is available for the selected suite/m.test(block);
+
+    results.push({
+      cve,
+      package: pkg,
+      installedVersion,
+      fixedVersions,
+      fixAvailableInSuite,
+    });
+  }
+
+  return results;
+}
+
 type WriteResource = (
   specName: string,
   name: string,
@@ -229,10 +312,16 @@ async function getInstalledVersion(pkg: string, timeoutMs: number): Promise<stri
   return packages.length > 0 ? packages[0].version : null;
 }
 
+/** True when `a` is dpkg-version-comparison >= `b`. */
+async function versionAtLeast(a: string, b: string, timeoutMs: number): Promise<boolean> {
+  const { code } = await runCommand("dpkg", ["--compare-versions", a, "ge", b], timeoutMs);
+  return code === 0;
+}
+
 /** Model definition for observing APT package inventory and pending upgrades. */
 export const model = {
   type: "@aaronge/apt-inventory",
-  version: "2026.08.25.3",
+  version: "2026.08.25.4",
   globalArguments: GlobalArgsSchema,
   reports: ["@aaronge/apt-inventory-delta"],
   resources: {
@@ -247,6 +336,12 @@ export const model = {
       schema: UpgradableSchema,
       lifetime: "infinite" as const,
       garbageCollection: 100,
+    },
+    "vulnerabilities": {
+      description: "Known CVEs against installed packages, per `debsecan`, cross-checked against dpkg's own version comparison to filter out vendor-rebuild false positives.",
+      schema: VulnerabilitiesSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
     },
   },
   methods: {
@@ -315,26 +410,59 @@ export const model = {
       },
     },
     install: {
-      description: "Installs a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq` (root required, gated by sudoers to specific packages). Idempotent: no-ops if already satisfied. Produces a fresh `installed` snapshot either way.",
+      description: "Installs a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq` (root required; sudoers grants this for any package). The real safety boundary is in this method, not sudoers: a mutating install only ever proceeds for a package+version this tool can itself verify, via the latest `upgradable` resource, is a currently pending apt-classified security update — anything else is refused. Idempotent: no-ops if already satisfied. Produces a fresh `installed` snapshot either way.",
       arguments: InstallArgsSchema,
       execute: async (
         args: z.infer<typeof InstallArgsSchema>,
-        context: { globalArgs: GlobalArgs; writeResource: WriteResource },
+        context: {
+          globalArgs: GlobalArgs;
+          writeResource: WriteResource;
+          readResource: (instanceName: string, version?: number) => Promise<Record<string, unknown> | null>;
+        },
       ) => {
         const current = await getInstalledVersion(args.package, context.globalArgs.timeout);
-        const satisfied = args.version ? current === args.version : current !== null;
 
-        if (!satisfied) {
-          const target = args.version ? `${args.package}=${args.version}` : args.package;
-          const { code, stderr } = await runCommand(
-            "sudo",
-            ["DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", target],
-            context.globalArgs.timeout,
+        const upgradableData = await context.readResource("upgradable") as
+          | z.infer<typeof UpgradableSchema>
+          | null;
+        const pendingEntry = upgradableData?.packages.find((p) => p.name === args.package) ?? null;
+
+        const targetVersion = args.version ?? pendingEntry?.candidateVersion ?? null;
+
+        // Already satisfied (or nothing verified is pending and we're not
+        // being asked for a specific version) — a pure no-op never needs the
+        // safety gate below, since nothing is being mutated.
+        if (current !== null && (targetVersion === null || current === targetVersion)) {
+          const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
+          return { dataHandles: [handle] };
+        }
+
+        // About to actually mutate the system — this is the safety gate.
+        // Sudoers permits *any* package here; this check is what actually
+        // restricts install to verified security updates.
+        if (!pendingEntry || !pendingEntry.isSecurity) {
+          throw new Error(
+            `Refusing to install ${args.package}${args.version ? `=${args.version}` : ""}: not a ` +
+              `currently pending security update per apt-local's own listUpgradable data. Run ` +
+              `listUpgradable first, or use apt-get directly for non-security installs.`,
           );
+        }
+        if (args.version && args.version !== pendingEntry.candidateVersion) {
+          throw new Error(
+            `Requested version ${args.version} does not match the verified security update ` +
+              `version ${pendingEntry.candidateVersion} for ${args.package}.`,
+          );
+        }
 
-          if (code !== 0) {
-            throw new Error(`apt-get install ${target} exited with code ${code}: ${stderr}`);
-          }
+        const target = `${args.package}=${pendingEntry.candidateVersion}`;
+        const { code, stderr } = await runCommand(
+          "sudo",
+          ["DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", target],
+          context.globalArgs.timeout,
+        );
+
+        if (code !== 0) {
+          throw new Error(`apt-get install ${target} exited with code ${code}: ${stderr}`);
         }
 
         const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
@@ -342,7 +470,7 @@ export const model = {
       },
     },
     remove: {
-      description: "Removes a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq` (root required, gated by sudoers to specific packages). Idempotent: no-ops if already absent. Produces a fresh `installed` snapshot either way.",
+      description: "Removes a package via `sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq` (root required; sudoers grants this for any package — no analogous safety gate to install's, since there's no equivalent notion of a 'verified safe' removal). Idempotent: no-ops if already absent. Produces a fresh `installed` snapshot either way.",
       arguments: RemoveArgsSchema,
       execute: async (
         args: z.infer<typeof RemoveArgsSchema>,
@@ -363,6 +491,53 @@ export const model = {
         }
 
         const handle = await captureInstalled(context.globalArgs.timeout, context.writeResource);
+        return { dataHandles: [handle] };
+      },
+    },
+    scanVulnerabilities: {
+      description: "Runs debsecan against installed packages and cross-checks its fix-available claims against dpkg's own version comparison — debsecan's database doesn't understand vendor rebuild suffixes (e.g. Raspberry Pi OS's `+rptN`), which produces false positives (verified on this machine: every current fix-available entry is one). Read-only, no privileges (debsecan itself needs no root).",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: { globalArgs: GlobalArgs; writeResource: WriteResource },
+      ) => {
+        const { stdout, code } = await runCommand(
+          "debsecan",
+          ["--suite", context.globalArgs.suite, "--format", "detail"],
+          context.globalArgs.timeout,
+        );
+
+        if (code !== 0) {
+          throw new Error(`debsecan exited with code ${code}`);
+        }
+
+        const parsed = parseDebsecanDetail(stdout);
+
+        const vulnerabilities: z.infer<typeof VulnerabilitySchema>[] = [];
+        for (const entry of parsed) {
+          let actuallyFixed = false;
+          if (entry.fixAvailableInSuite) {
+            for (const fixedVersion of entry.fixedVersions) {
+              if (await versionAtLeast(entry.installedVersion, fixedVersion, context.globalArgs.timeout)) {
+                actuallyFixed = true;
+                break;
+              }
+            }
+          }
+          vulnerabilities.push({ ...entry, actuallyFixed });
+        }
+
+        const actionableCount = vulnerabilities.filter((v) => v.fixAvailableInSuite && !v.actuallyFixed).length;
+        const falsePositiveCount = vulnerabilities.filter((v) => v.fixAvailableInSuite && v.actuallyFixed).length;
+
+        const handle = await context.writeResource("vulnerabilities", "vulnerabilities", {
+          vulnerabilities,
+          count: vulnerabilities.length,
+          actionableCount,
+          falsePositiveCount,
+          capturedAt: new Date().toISOString(),
+        });
+
         return { dataHandles: [handle] };
       },
     },
