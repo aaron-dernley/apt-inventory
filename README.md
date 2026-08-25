@@ -23,10 +23,10 @@ Developed and verified against:
 
 It is expected to work unmodified on other Debian-family distros/releases and
 other architectures, but the `dpkg-query`/`apt-get` output parsing has only
-been hand-verified on the above. If you port this to another distro or
-codename, update `securityOrigin` (the security-update classification substring
-changes with the release codename) and re-verify the parser against real
-output before trusting the data.
+been hand-verified on the above. If you port this to a distro where the apt
+archive's security suite isn't literally `stable-security` (see "Security
+update classification" below), you'll need to update `securityOrigin` and
+re-verify against real output before trusting the data.
 
 ## Status
 
@@ -34,20 +34,26 @@ output before trusting the data.
 |---|---|---|
 | 1 | `query` / `listUpgradable` (read-only, no privileges) | Done |
 | 2 | `apt-report` workflow over versioned data | Done |
-| 3 | `refresh` (needs root) | Not started — requires a sudoers decision, see below |
+| 3 | `refresh` (needs root) | Done |
 | 4 | `install` / `remove` (needs root, gated) | Optional, not started |
 
 Scheduling `apt-report` to actually run daily (via `swamp serve`) is deliberately
-on hold until Phase 2 has been exercised for a while — see "Scheduling" below.
+on hold until this has been exercised for a while — see "Scheduling" below.
 
 ## Privileges
 
-`query` and `listUpgradable` need no privileges. `refresh`/`install`/`remove`
-(Phase 3/4) need root, which a non-interactive swamp workflow can't prompt
-for — that requires either a narrow `/etc/sudoers.d/swamp-apt` entry or running
-the whole workflow under sudo. **Neither is implemented without explicit
-user approval first** — this machine is intended to become the household DNS
-server, and widening its sudo surface is not this model's call to make alone.
+`query` and `listUpgradable` need no privileges. `refresh` needs root, granted
+via a narrow sudoers entry (approved by the user before being applied, per the
+spec — this isn't a call the agent makes alone):
+
+```
+# /etc/sudoers.d/swamp-apt (mode 0440, root:root)
+aaronge ALL=(root) NOPASSWD: /usr/bin/apt-get update -qq
+```
+
+This grants NOPASSWD for exactly that one invocation — nothing else gains
+root. `install`/`remove` (Phase 4, optional, not built) would need their own
+explicit approval and their own narrowly-scoped sudoers lines if pursued.
 
 ## Model type
 
@@ -78,11 +84,24 @@ The `workflows/workflow-apt-report.yaml` workflow ties it together:
    failed run is the v1 notification mechanism.
 
 Verified end-to-end against the real machine, including re-runs to confirm
-version history and delta computation. The `securityCount > 0` failure path
-itself hasn't been exercised live (the machine currently has no pending
-security updates) — it's covered by parser unit tests for security
-classification and by the assert step matching the manual's documented
-pattern exactly.
+version history, delta computation, `swamp data query 'attributes.securityCount
+> 0'` returning rows, and the `alert` job genuinely failing the workflow run
+when security updates are pending (a real OpenSSL security update surfaced
+during Phase 3 testing — see below).
+
+## Security update classification
+
+**`securityOrigin`'s default is `stable-security`, not a codename.** This
+correction came from a real bug caught during Phase 3 testing: this machine's
+`/etc/apt/sources.list.d/debian.sources` configures `Suites: trixie-security`,
+but apt does not report that string back — real `Inst` line output showed
+`Debian-Security:13/stable-security`, so a codename-based default (the
+spec's original assumption) would silently classify every real security
+update as non-security. `stable-security` is also the *more* durable choice
+long-term: it doesn't change across codenames/releases as long as the machine
+tracks the `stable` suite, whereas a codename-based substring would need
+updating on every release upgrade and would never actually match in the
+meantime.
 
 ## Scheduling
 

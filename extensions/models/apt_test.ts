@@ -43,6 +43,20 @@ Conf cowsay (3.03+dfsg2-8 Debian:13.6/stable [all])`;
   ]);
 });
 
+Deno.test("parseAptSimulation - real Debian security origin matches 'stable-security', not the codename", () => {
+  // Verified against real apt-get output on this machine (Debian 13
+  // "trixie"): despite sources.list configuring the suite as
+  // `trixie-security`, apt reports the origin as `Debian-Security:13/stable-security`
+  // — the codename never appears. `securityOrigin`'s default must be
+  // "stable-security", not a codename-based value, or every real security
+  // update on this machine silently classifies as non-security.
+  const stdout = `${NOTE_BANNER}
+Inst openssl [3.5.6-1~deb13u2+rpt1] (3.5.7-1~deb13u2 Debian-Security:13/stable-security [arm64])`;
+  const result = parseAptSimulation(stdout, "stable-security");
+  assertEquals(result.length, 1);
+  assertEquals(result[0].isSecurity, true);
+});
+
 Deno.test("parseAptSimulation - classifies security origin via substring match", () => {
   const stdout = `${NOTE_BANNER}
 Inst curl [8.14.0-1] (8.14.0-1+deb13u1 Debian-Security:13/trixie-security [arm64])`;

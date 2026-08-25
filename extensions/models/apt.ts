@@ -17,10 +17,16 @@
 import { z } from "npm:zod@4";
 
 const GlobalArgsSchema = z.object({
-  securityOrigin: z.string().default("trixie-security").describe(
+  securityOrigin: z.string().default("stable-security").describe(
     "Substring matched against the origin field in `Inst` lines to classify " +
-      "an upgrade as security-relevant. Configurable because the codename " +
-      "changes on release upgrade (e.g. trixie -> forky).",
+      "an upgrade as security-relevant. Despite sources.list configuring the " +
+      "suite as e.g. `trixie-security`, apt reports the archive's own " +
+      "published Suite in Inst lines, which reads like " +
+      "`Debian-Security:13/stable-security` — NOT the codename (verified " +
+      "against real apt-get output on Debian 13). `stable-security` is the " +
+      "durable substring: it doesn't change across codenames/releases as " +
+      "long as the machine tracks the `stable` suite, unlike a codename-based " +
+      "match which would never fire.",
   ),
   timeout: z.number().positive().default(120000).describe(
     "Timeout in milliseconds for apt/dpkg subprocess calls. Apt operations " +
@@ -170,7 +176,7 @@ export function parseAptSimulation(
 /** Model definition for observing APT package inventory and pending upgrades. */
 export const model = {
   type: "@aaronge/apt-inventory",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   globalArguments: GlobalArgsSchema,
   reports: ["@aaronge/apt-inventory-delta"],
   resources: {
@@ -261,6 +267,26 @@ export const model = {
         });
 
         return { dataHandles: [handle] };
+      },
+    },
+    refresh: {
+      description: "Refreshes apt's package lists via `sudo apt-get update -qq` (root required; apt lists only, no other system changes). Produces no resource — run listUpgradable/query afterward to see updated state.",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: { globalArgs: GlobalArgs },
+      ) => {
+        const { code, stderr } = await runCommand(
+          "sudo",
+          ["apt-get", "update", "-qq"],
+          context.globalArgs.timeout,
+        );
+
+        if (code !== 0) {
+          throw new Error(`sudo apt-get update -qq exited with code ${code}: ${stderr}`);
+        }
+
+        return { dataHandles: [] };
       },
     },
   },

@@ -5,6 +5,6 @@ name: apt-local
 version: 1
 tags: {}
 globalArguments:
-  securityOrigin: trixie-security
+  securityOrigin: stable-security
   timeout: 120000
 methods: {}

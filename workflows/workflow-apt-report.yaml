@@ -3,6 +3,20 @@ name: apt-report
 description: Collects apt package/upgrade state, prints a human-readable report with the delta since the last run, and fails the run when security-relevant upgrades are pending.
 tags: {}
 jobs:
+  - name: refresh
+    description: Refresh apt's package lists (root, apt lists only — no other system changes) so collect reflects current repo state.
+    steps:
+      - name: apt-update
+        task:
+          type: model_method
+          modelIdOrName: apt-local
+          methodName: refresh
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+
   - name: collect
     description: Observe current apt state (read-only, no privileges).
     steps:
@@ -24,7 +38,10 @@ jobs:
         dependsOn: []
         weight: 0
         allowFailure: false
-    dependsOn: []
+    dependsOn:
+      - job: refresh
+        condition:
+          type: succeeded
     weight: 0
 
   - name: report
