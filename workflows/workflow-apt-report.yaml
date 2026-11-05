@@ -1,5 +1,5 @@
 id: 2a48804b-3b12-4d4c-8108-fdf2559920a3
-name: apt-report
+name: "@aaronge/apt-report"
 description: Collects apt package/upgrade state, prints a human-readable report with the delta since the last run, and fails the run when security-relevant upgrades are pending.
 tags: {}
 trigger:
@@ -53,7 +53,8 @@ jobs:
         description: Report values come from the @aaronge/apt-inventory-delta model-scope report, computed automatically after collect's method runs.
         task:
           type: model_method
-          modelIdOrName: apt-report-printer
+          modelType: "command/shell"
+          modelName: apt-report-printer
           methodName: execute
           inputs:
             run: |

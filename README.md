@@ -251,6 +251,12 @@ an install gate.
 
 ## Scheduling
 
+The workflow ships in the package as `@aaronge/apt-report` (listed under
+`workflows:` in `manifest.yaml`), so `swamp extension pull
+@aaronge/apt-inventory` installs it alongside the model. It expects a model
+instance named `apt-local`; its `report` step's `command/shell` model
+(`apt-report-printer`) is created automatically on first run.
+
 `apt-report` runs 3x daily — 06:00, 12:00, 20:00 (`trigger: schedule: "0
 6,12,20 * * *"` in `workflows/workflow-apt-report.yaml`), via `swamp serve`
 running as a systemd service:
@@ -285,16 +291,16 @@ gotcha `swamp help serve` calls out directly (scheduled runs fail with
 to `$HOME/.swamp`). Binds to `127.0.0.1:9090` only (the default) — no need
 for network exposure or auth just to run a local schedule.
 
-Verified after starting the service: `swamp workflow trigger get apt-report`
+Verified after starting the service: `swamp workflow trigger get @aaronge/apt-report`
 shows the effective schedule as `"0 6,12,20 * * *"`; the service's own
-startup log confirms `Registered schedule for workflow "apt-report": "0
+startup log confirms `Registered schedule for workflow "@aaronge/apt-report": "0
 6,12,20 * * *"` and `Scheduled execution service started with 1 schedules`;
 `systemctl is-enabled` confirms it'll survive a reboot.
 
 **Changing the schedule requires a `swamp-serve` restart** — schedules are
 registered at server startup, not live-reloaded from the workflow file.
 After editing `trigger.schedule`, run `sudo systemctl restart
-swamp-serve.service` and re-check `swamp workflow trigger get apt-report`.
+swamp-serve.service` and re-check `swamp workflow trigger get @aaronge/apt-report`.
 
 **Not verified**: whether the cron expression is interpreted in the system's
 local timezone (`Europe/London`) or UTC — the manual doesn't document this
@@ -393,7 +399,7 @@ echo "swamp-serve stopped and disabled. Scheduled apt-report runs will not happe
 set -euo pipefail
 sudo systemctl enable --now swamp-serve.service
 sleep 1
-swamp workflow trigger get apt-report --json
+swamp workflow trigger get @aaronge/apt-report --json
 echo "swamp-serve running and enabled. Scheduled apt-report runs: 06:00, 12:00, 20:00 daily."
 ```
 
