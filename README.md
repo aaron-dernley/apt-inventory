@@ -38,13 +38,13 @@ re-verify against real output before trusting the data.
 | 4 | `install` / `remove` (needs root, gated) | Done |
 | 5 | `scanVulnerabilities` (debsecan, CVE cross-check); widened install/remove sudoers | Done |
 
-Scheduling `apt-report` to actually run daily (via `swamp serve`) is deliberately
-on hold until this has been exercised for a while — see "Scheduling" below.
+`apt-report` is scheduled 3x daily under `swamp serve`. See "Scheduling"
+below.
 
 ## Privileges
 
 **Note on scope**: the sudoers rules below assume the account running
-`swamp-serve` has *only* the grants shown here. If that account has any
+`swamp serve` (`aaronge` on this Pi) has *only* the grants shown here. If that account has any
 broader pre-existing sudo access (check with `sudo -l`), this scoping isn't
 a hard boundary — any process running as that account already has whatever
 that broader access allows, independent of anything below. Worth verifying
@@ -258,90 +258,82 @@ instance named `apt-local`; its `report` step's `command/shell` model
 (`apt-report-printer`) is created automatically on first run.
 
 `apt-report` runs 3x daily — 06:00, 12:00, 20:00 (`trigger: schedule: "0
-6,12,20 * * *"` in `workflows/workflow-apt-report.yaml`), via `swamp serve`
-running as a systemd service:
+6,12,20 * * *"` in `workflows/workflow-apt-report.yaml`). `trigger.schedule`
+only fires while a `swamp serve` is running for the repo the workflow is
+pulled into. Change the cadence without editing the package with
+`swamp workflow trigger set @aaronge/apt-report --schedule "..."`, or a
+`triggers:` entry in the serve's `serve.yaml`.
 
-```
-# /etc/systemd/system/swamp-serve.service
-[Unit]
-Description=swamp serve (apt-inventory)
-After=network-online.target
-Wants=network-online.target
+On this Pi it runs in the single ops repo,
+[`rpi-metrics-bridge`](https://github.com/aaron-dernley/rpi-metrics-bridge).
+Since 2026-11-05 that repo's one `swamp serve` runs every scheduled
+`@aaronge/*` workflow. It's the systemd user unit `swamp-serve.service`
+(installed with `swamp serve daemon enable --config serve.yaml`, linger on
+so it starts at boot), bound to `127.0.0.1:9090`, running one scheduled
+workflow at a time. See that repo's README and
+`docs/swamp-ops-best-practices.md`. Before then, this repo had its own
+system-level `swamp-serve.service` running `swamp serve` for apt-report
+alone. That unit was removed.
 
-[Service]
-Type=simple
-User=aaronge
-Group=aaronge
-Environment=HOME=/home/aaronge
-WorkingDirectory=/home/aaronge/Repositories/apt-inventory
-ExecStart=/usr/local/bin/swamp serve --repo-dir /home/aaronge/Repositories/apt-inventory
-Restart=on-failure
-RestartSec=5
+The serve runs as `aaronge`, not root. This matters because
+`refresh`/`install`/`remove`'s `sudo` calls are keyed to the `aaronge`
+sudoers entries above; running as root would sidestep them entirely. The
+unit swamp generates sets `SWAMP_HOME` and `SWAMP_CONFIG_DIR`, without
+which scheduled runs fail with `"Unknown model type"`.
 
-[Install]
-WantedBy=multi-user.target
-```
-
-`systemctl enable --now swamp-serve.service`. Runs as `aaronge` (not root) —
-this matters because `refresh`/`install`/`remove`'s `sudo` calls are keyed to
-the `aaronge` sudoers entries; running the service as root would sidestep
-those entries entirely. `HOME=/home/aaronge` is set explicitly per the
-gotcha `swamp help serve` calls out directly (scheduled runs fail with
-`"Unknown model type"` without it, since swamp resolves extensions relative
-to `$HOME/.swamp`). Binds to `127.0.0.1:9090` only (the default) — no need
-for network exposure or auth just to run a local schedule.
-
-Verified after starting the service: `swamp workflow trigger get @aaronge/apt-report`
-shows the effective schedule as `"0 6,12,20 * * *"`; the service's own
-startup log confirms `Registered schedule for workflow "@aaronge/apt-report": "0
-6,12,20 * * *"` and `Scheduled execution service started with 1 schedules`;
-`systemctl is-enabled` confirms it'll survive a reboot.
-
-**Changing the schedule requires a `swamp-serve` restart** — schedules are
-registered at server startup, not live-reloaded from the workflow file.
-After editing `trigger.schedule`, run `sudo systemctl restart
-swamp-serve.service` and re-check `swamp workflow trigger get @aaronge/apt-report`.
+Verify with `swamp workflow trigger get @aaronge/apt-report` from the ops
+repo. The serve's startup log (`journalctl --user -u swamp-serve`) also
+shows `Registered schedule for workflow "@aaronge/apt-report": "0 6,12,20 *
+* *"`. Schedules from workflow files are registered at serve startup, so
+after changing a workflow's own `trigger.schedule`, restart the serve
+(`systemctl --user restart swamp-serve`). `serve.yaml` overrides are
+picked up by `swamp serve reload` because the ops serve runs with
+`hot-reload: true`.
 
 **Not verified**: whether the cron expression is interpreted in the system's
 local timezone (`Europe/London`) or UTC — the manual doesn't document this
-either way. Worth confirming once the first real 06:00 run lands; if it
+either way. The serve's health snapshot reports its `timeZone`; if a run
 fires at the wrong wall-clock hour, adjust the cron hour field accordingly.
 
 ## Day-to-day operation
 
 A small toolkit in `~/.local/bin/` (outside this repo — personal machine
-tooling, not part of the swamp extension) makes this genuinely low-effort to
-live with day to day:
+tooling, not part of the swamp extension) makes this low-effort to live
+with day to day. Because one serve now runs every scheduled workflow on
+the Pi, `apt-on`/`apt-off` control all of them, not just apt-report.
 
 | Command | Does |
 |---|---|
-| `apt-status` | One-shot status: is `swamp-serve` up, recent run history (with failure reasons), the latest report, and whether anything security-relevant is pending right now. Works from any directory. |
+| `apt-status` | One-shot status: is the ops `swamp-serve` up, recent apt-report run history (with failure reasons), the latest report, and whether anything security-relevant is pending right now. Works from any directory. |
 | `apt-monitor` | Opens a `foot` terminal window that auto-refreshes `apt-status` every 30s — a live dashboard you can just glance at. Independent of any shell session; close the window whenever. |
-| `apt-off` | Stops `swamp-serve` **and** disables it (won't restart on reboot either). The single "turn it off" command. |
-| `apt-on` | Re-enables and restarts `swamp-serve`. The single "turn it back on" command. |
+| `apt-off` | Stops the ops `swamp-serve` **and** disables it (won't restart on reboot either). Pauses every scheduled `@aaronge/*` workflow. |
+| `apt-on` | Re-enables and restarts the ops `swamp-serve`. |
 
-`~/.bashrc` also exports `SWAMP_SERVE_URL=ws://127.0.0.1:9090`, so any plain
-`swamp` command (`swamp data query ...`, `swamp report get ...`, etc.) works
-from any directory too — no more `cd`-ing into the repo or remembering
-`--repo-dir`.
+`~/.bashrc` maps the ops repo to `ws://127.0.0.1:9090` in its
+`SWAMP_SERVE_REPOS` table, so plain `swamp` commands run inside
+`rpi-metrics-bridge` go through the serve. `apt-status` sets
+`SWAMP_SERVE_URL` itself, so it works from any directory.
 
-**Storage footprint** (checked directly, given the Pi's limited space): the
-`.swamp/data` directory is a few MB and bounded by each resource's
-`garbageCollection` cap — it will not grow unboundedly. The systemd journal
-(covering `swamp-serve`'s own logs, among everything else on the machine) is
-in the single-digit MB range and self-vacuums old entries by default. Neither
-is a real concern against 16GB free.
+**Storage footprint:** an extension's per-resource `garbageCollection` cap
+is only enforced when something applies it: `autoGc: true` in
+`.swamp.yaml` (at write time) or a manual `swamp data gc`. Without either,
+versions accumulate without limit. That happened in the ops repo, where
+2.85M stale versions (41.6 GB) built up from per-minute runs until a
+manual GC on 2026-11-05. The ops repo now sets `autoGc: true` plus
+`garbageCollection.automatic`, which runs an hourly retention pass under
+serve.
 
 **Reproducing the toolkit** (e.g. after a fresh SD card):
 
 ```bash
 # ~/.local/bin/apt-status — one-shot status check
 #!/bin/bash
+# Quick status check for apt-inventory, served by the ops repo (rpi-metrics-bridge).
 set -euo pipefail
 export SWAMP_SERVE_URL="${SWAMP_SERVE_URL:-ws://127.0.0.1:9090}"
 
 echo "=== swamp-serve service ==="
-systemctl is-active swamp-serve 2>&1 || true
+systemctl --user is-active swamp-serve 2>&1 || true
 
 echo
 echo "=== recent apt-report runs ==="
@@ -349,7 +341,10 @@ swamp workflow history search --json \
   | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-for r in d.get('results', [])[:5]:
+# The ops serve runs every @aaronge/* workflow, so keep only apt-report's.
+runs = [r for r in d.get('results', [])
+        if (r.get('workflowName') or r.get('workflow') or '').endswith('apt-report')]
+for r in runs[:5]:
     status = r.get('status')
     started = r.get('startedAt', '?')
     trigger = r.get('triggerSource', '?')
@@ -379,6 +374,7 @@ else:
 ```bash
 # ~/.local/bin/apt-monitor — friendly live dashboard window
 #!/bin/bash
+# Opens a foot terminal window with a live-refreshing apt-inventory dashboard.
 set -euo pipefail
 setsid foot -T "apt-inventory monitor" watch -n 30 -c apt-status >/dev/null 2>&1 &
 disown
@@ -386,21 +382,27 @@ echo "Opened. Close the window whenever you don't need it — it's independent o
 ```
 
 ```bash
-# ~/.local/bin/apt-off — stop and disable the schedule
+# ~/.local/bin/apt-off — stop and disable the ops serve
 #!/bin/bash
+# Stops the Pi's ops swamp serve now AND disables it, so it won't come back
+# after a reboot. That pauses EVERY scheduled @aaronge/* workflow, not just
+# apt-report, since one serve runs them all.
 set -euo pipefail
-sudo systemctl disable --now swamp-serve.service
-echo "swamp-serve stopped and disabled. Scheduled apt-report runs will not happen until you run 'apt-on'."
+systemctl --user disable --now swamp-serve.service
+echo "Ops swamp-serve stopped and disabled. No scheduled workflows (apt-report included) will run until you run 'apt-on'."
 ```
 
 ```bash
-# ~/.local/bin/apt-on — re-enable and start the schedule
+# ~/.local/bin/apt-on — re-enable and start the ops serve
 #!/bin/bash
+# Turns the Pi's ops swamp serve back on (rpi-metrics-bridge, user service
+# installed by `swamp serve daemon enable`). apt-report is one of its
+# scheduled workflows, alongside every other @aaronge/* schedule.
 set -euo pipefail
-sudo systemctl enable --now swamp-serve.service
+systemctl --user enable --now swamp-serve.service
 sleep 1
-swamp workflow trigger get @aaronge/apt-report --json
-echo "swamp-serve running and enabled. Scheduled apt-report runs: 06:00, 12:00, 20:00 daily."
+SWAMP_SERVE_URL=ws://127.0.0.1:9090 swamp workflow trigger get @aaronge/apt-report --json
+echo "Ops swamp-serve running and enabled. Scheduled apt-report runs: 06:00, 12:00, 20:00 daily."
 ```
 
 All four need `chmod +x`, and `~/.local/bin` needs to be on `$PATH` (already
